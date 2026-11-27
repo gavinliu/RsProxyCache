@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <stdint.h>
+#include <string.h>
 
 extern char *rpc_start(const char *, uint64_t, const char *);
 extern char *rpc_playback_url(const char *);
@@ -9,9 +10,28 @@ extern char *rpc_download_cancel(const char *);
 extern void rpc_close(void);
 extern void rpc_free_string(char *);
 
+/* Rust returns standard UTF-8. NewStringUTF only accepts modified UTF-8 and
+ * rejects supplementary characters, so decode through String(byte[], UTF-8). */
 static jstring java_string(JNIEnv *env, char *value) {
     if (!value) return NULL;
-    jstring result = (*env)->NewStringUTF(env, value);
+    jstring result = NULL;
+    jsize length = (jsize)strlen(value);
+    jbyteArray bytes = (*env)->NewByteArray(env, length);
+    if (bytes) {
+        (*env)->SetByteArrayRegion(env, bytes, 0, length, (const jbyte *)value);
+        jclass class = (*env)->FindClass(env, "java/lang/String");
+        jstring charset = (*env)->NewStringUTF(env, "UTF-8");
+        if (class && charset) {
+            jmethodID constructor =
+                    (*env)->GetMethodID(env, class, "<init>", "([BLjava/lang/String;)V");
+            if (constructor) {
+                result = (jstring)(*env)->NewObject(env, class, constructor, bytes, charset);
+            }
+        }
+        if (class) (*env)->DeleteLocalRef(env, class);
+        if (charset) (*env)->DeleteLocalRef(env, charset);
+        (*env)->DeleteLocalRef(env, bytes);
+    }
     rpc_free_string(value);
     return result;
 }

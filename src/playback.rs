@@ -35,6 +35,12 @@ use crate::{
 pub(crate) type Body = UnsyncBoxBody<Bytes, io::Error>;
 type Sender = mpsc::Sender<io::Result<Frame<Bytes>>>;
 
+/// Marks an internal offline-download request. Such requests must always write
+/// to the cache and never contend for the player-oriented request lock, so a
+/// concurrent playback stream cannot turn a download into a cache bypass.
+#[derive(Clone)]
+pub(crate) struct OfflineFetch;
+
 pub struct Playback {
     pub(crate) downloads: crate::offline::Downloads,
     recent_variants: Mutex<HashMap<String, String>>,
@@ -43,6 +49,7 @@ pub struct Playback {
     pub(crate) signing_key: Option<ring::hmac::Key>,
     request_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     gaps: Mutex<HashMap<GapKey, Weak<GapFlight>>>,
+    whole_flights: Mutex<HashMap<String, Weak<WholeFlight>>>,
 }
 
 enum BodyWriter {
@@ -71,6 +78,7 @@ enum Part {
         body: Incoming,
         length: Option<u64>,
         writer: Option<Box<WholeWriter>>,
+        flight: Option<WholeLeader>,
     },
     Passthrough {
         body: Incoming,
@@ -120,6 +128,21 @@ enum GapClaim {
     Waiting(watch::Receiver<Option<GapOutcome>>),
 }
 
+/// Tracks an in-flight whole-file cache write so concurrent requests for the
+/// same representation do not stage duplicate copies against the capacity.
+struct WholeFlight {
+    metadata: Metadata,
+    completion: watch::Sender<bool>,
+}
+
+struct WholeLeader(Arc<WholeFlight>);
+
+impl Drop for WholeLeader {
+    fn drop(&mut self) {
+        self.0.completion.send_replace(true);
+    }
+}
+
 impl Playback {
     pub fn new(cache: Arc<Cache>, origin: Origin) -> Self {
         Self {
@@ -130,6 +153,7 @@ impl Playback {
             signing_key: None,
             request_locks: Mutex::default(),
             gaps: Mutex::default(),
+            whole_flights: Mutex::default(),
         }
     }
 
@@ -243,7 +267,8 @@ impl Playback {
         tracing::Span::current().record("cache_key", &key);
         tracing::debug!(range = %requested.upstream(), "playback request");
 
-        let guard = if head {
+        let offline = request.extensions().get::<OfflineFetch>().is_some();
+        let guard = if head || offline {
             None
         } else {
             let lock_key = format!("{key}:{}", requested.upstream());
@@ -255,7 +280,7 @@ impl Playback {
         };
         // A player may open a new connection before draining an earlier response.
         // After a bounded wait, relay a fresh response without competing for its cache writes.
-        let bypass_cache = !head && guard.is_none();
+        let bypass_cache = !head && !offline && guard.is_none();
         let generation = self.cache.refresh();
         let previous = self.cache.metadata(&key);
         if head {
@@ -349,7 +374,8 @@ impl Playback {
                 let headers = origin.headers().clone();
                 let length = content_length(&headers)?;
                 let part = if !bypass_cache
-                    && (resource == Some(Resource::Media)
+                    && (offline
+                        || resource == Some(Resource::Media)
                         || uri
                             .path()
                             .as_bytes()
@@ -361,14 +387,19 @@ impl Playback {
                             .is_some_and(|value| value.starts_with("video/")))
                 {
                     let metadata = origin_metadata(&origin, length.unwrap_or_default())?;
-                    let writer = self
-                        .cache
-                        .whole_writer(source.to_owned(), metadata, length, generation)
+                    let flight = self.claim_whole(&key, &metadata);
+                    let writer = flight
+                        .as_ref()
+                        .and_then(|_| {
+                            self.cache
+                                .whole_writer(source.to_owned(), metadata, length, generation)
+                        })
                         .map(Box::new);
                     Part::RemoteWhole {
                         body: origin.into_body(),
                         length,
                         writer,
+                        flight,
                     }
                 } else {
                     Part::Passthrough {
@@ -501,6 +532,40 @@ impl Playback {
         });
         gaps.insert(key, Arc::downgrade(&flight));
         GapClaim::Leader(GapLeader(flight))
+    }
+
+    /// Only one whole-file write per cache key and representation at a time.
+    /// A different representation may take over; its adoption retires the old
+    /// version so the previous writer stops reserving capacity.
+    fn claim_whole(&self, key: &str, metadata: &Metadata) -> Option<WholeLeader> {
+        let mut flights = self.whole_flights.lock().unwrap();
+        flights.retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = flights.get(key).and_then(Weak::upgrade)
+            && !*flight.completion.borrow()
+            && flight.metadata == *metadata
+        {
+            return None;
+        }
+        let flight = Arc::new(WholeFlight {
+            metadata: metadata.clone(),
+            completion: watch::channel(false).0,
+        });
+        flights.insert(key.to_owned(), Arc::downgrade(&flight));
+        Some(WholeLeader(flight))
+    }
+
+    pub(crate) async fn wait_whole(&self, key: &str) {
+        let receiver = {
+            let mut flights = self.whole_flights.lock().unwrap();
+            flights.retain(|_, flight| flight.strong_count() > 0);
+            flights
+                .get(key)
+                .and_then(Weak::upgrade)
+                .map(|flight| flight.completion.subscribe())
+        };
+        if let Some(mut receiver) = receiver {
+            let _ = receiver.wait_for(|done| *done).await;
+        }
     }
 
     async fn prepare(
@@ -698,8 +763,10 @@ impl Playback {
                         }
                         result
                     }
-                    Part::RemoteWhole { body, length, writer } => {
-                        send_remote(&sender, body, length, writer.map(|writer| BodyWriter::Whole(*writer))).await
+                    Part::RemoteWhole { body, length, writer, flight } => {
+                        let result = send_remote(&sender, body, length, writer.map(|writer| BodyWriter::Whole(*writer))).await;
+                        drop(flight);
+                        result
                     }
                     Part::Passthrough { body, length } => {
                         send_remote(&sender, body, length, None).await

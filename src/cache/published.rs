@@ -102,7 +102,10 @@ pub(super) fn publish_complete(cache: &Arc<Cache>, version: &CacheVersion) -> Re
             return Ok(());
         };
         let stage = cache.stage_file()?;
-        if index.reserve(cache.capacity, wanted.end).is_none() {
+        if index
+            .reserve(cache.capacity, wanted.end, Some(version))
+            .is_none()
+        {
             record_download_failure(DownloadCacheFailure::Capacity);
             return Ok(());
         }
@@ -111,6 +114,7 @@ pub(super) fn publish_complete(cache: &Arc<Cache>, version: &CacheVersion) -> Re
             cache: cache.clone(),
             size: wanted.end,
             generation: index.generation,
+            version: version.id,
         };
         (covering, stage, reservation)
     };
@@ -442,7 +446,7 @@ pub(super) fn publish_playlist(
         })?
     };
     metadata.size = local.len() as u64;
-    if index.reserve(capacity, metadata.size).is_none() {
+    if index.reserve(capacity, metadata.size, None).is_none() {
         record_download_failure(DownloadCacheFailure::Capacity);
         return Ok(false);
     }
@@ -526,7 +530,9 @@ fn publish_slice(
     }
     let path = base.with_file_name(name);
     let size = span.end - span.start;
-    index.reserve(capacity, size).context(PublicationCapacity)?;
+    index
+        .reserve(capacity, size, None)
+        .context(PublicationCapacity)?;
     // The index remains locked through the write and commit.
     index.reserved -= size;
     let mut stage = tempfile::Builder::new()

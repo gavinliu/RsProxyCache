@@ -199,6 +199,14 @@ pub struct Cache {
     dir: PathBuf,
     capacity: u64,
     index: Mutex<Index>,
+    /// Test seams, per instance so parallel tests on different caches never
+    /// consume each other's hooks. They fire where an unknown-length whole
+    /// finish corrects its recorded size (finish) and between that correction
+    /// and the commit (commit).
+    #[cfg(test)]
+    whole_finish_race: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    whole_commit_race: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Default)]
@@ -206,6 +214,10 @@ struct Index {
     entries: HashMap<String, Vec<Arc<Entry>>>,
     size: u64,
     reserved: u64,
+    /// Staged bytes still held by in-flight writers, per version id, so quota
+    /// owned by a retired representation can be reclaimed without waiting for
+    /// its (possibly paused) writer to drop.
+    reservations: HashMap<u64, (String, u64)>,
     versions: HashMap<String, Weak<CacheVersion>>,
     next_version: u64,
     retired: Vec<(Weak<Entry>, u64)>,
@@ -220,13 +232,14 @@ struct Reservation {
     cache: Arc<Cache>,
     size: u64,
     generation: u64,
+    version: u64,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut index = self.cache.index.lock().unwrap();
         if self.generation == index.generation {
-            index.reserved -= self.size;
+            index.release_reservation(self.version, self.size);
         }
     }
 }
@@ -255,6 +268,10 @@ impl Cache {
             dir,
             capacity,
             index: Mutex::new(index),
+            #[cfg(test)]
+            whole_finish_race: Mutex::new(None),
+            #[cfg(test)]
+            whole_commit_race: Mutex::new(None),
         })
     }
 
@@ -559,14 +576,17 @@ impl Cache {
         if !self.refresh_index(&mut index) || !index.is_current(version) {
             return None;
         }
-        index.reserve(self.capacity, size).or_else(|| {
-            record_download_failure(DownloadCacheFailure::Capacity);
-            None
-        })?;
+        index
+            .reserve(self.capacity, size, Some(version))
+            .or_else(|| {
+                record_download_failure(DownloadCacheFailure::Capacity);
+                None
+            })?;
         Some(Reservation {
             cache: self.clone(),
             size,
             generation: index.generation,
+            version: version.id,
         })
     }
 
@@ -593,14 +613,18 @@ impl Cache {
             })
             .ok()?;
         drop(index);
+        // Adopt at header time so a later finish cannot retire a newer
+        // representation adopted while this download was still in flight.
+        let version = self.adopt(&source, metadata, generation)?;
         let reservation = Reservation {
             cache: self.clone(),
             size: 0,
             generation,
+            version: version.id,
         };
         Some(WholeWriter {
             source,
-            metadata,
+            version,
             data: StagedInterval::open(reservation, stage, 0..0).ok()?,
         })
     }
@@ -678,6 +702,50 @@ impl Cache {
         Some(index.set_version(source, metadata))
     }
 
+    /// Record the received size of an unknown-length whole response and adopt
+    /// the corrected representation in a single index lock, verifying the
+    /// expected version is still current. A newer representation adopted while
+    /// the download was in flight must never be retired by this late finish.
+    pub(crate) fn adopt_received_size(
+        &self,
+        source: &str,
+        expected: &CacheVersion,
+        size: u64,
+        generation: u64,
+    ) -> Option<Arc<CacheVersion>> {
+        let key = key(source);
+        let mut index = self.index.lock().unwrap();
+        if !self.refresh_index(&mut index)
+            || index.generation != generation
+            || !index.is_current(expected)
+        {
+            return None;
+        }
+        let mut metadata = expected.metadata.clone();
+        metadata.size = size;
+        if index
+            .entries
+            .get(&key)
+            .and_then(|entries| entries.last())
+            .is_some_and(|entry| entry.record.metadata != metadata)
+        {
+            index.clear(&key);
+        }
+        let updated = index.set_version(source, metadata);
+        // The same writer keeps staging the same bytes under the corrected
+        // version id. Migrate its quota in this lock so the window before
+        // commit neither looks stale (another reserve reclaiming live quota)
+        // nor leaks at commit (which releases by the adopted id).
+        if let Some((staged_key, size)) = index.reservations.remove(&expected.id) {
+            index
+                .reservations
+                .entry(updated.id)
+                .or_insert_with(|| (staged_key, 0))
+                .1 += size;
+        }
+        Some(updated)
+    }
+
     pub fn version_for_patch(&self, key: &str, metadata: &Metadata) -> Option<Arc<CacheVersion>> {
         let mut index = self.index.lock().unwrap();
         if let Some(active) = index.active(key) {
@@ -736,7 +804,7 @@ impl Reservation {
                     .inspect_err(|error| {
                         record_io_failure(error.downcast_ref(), DownloadCacheFailure::Publish)
                     })?;
-                index.reserved -= self.size;
+                index.release_reservation(version.id, self.size);
                 self.size = 0;
                 index.publish_playlists(&self.cache.dir, self.cache.capacity);
             }
@@ -757,7 +825,7 @@ impl Reservation {
             remove(&path);
             return Err(error.into());
         }
-        index.reserved -= self.size;
+        index.release_reservation(version.id, self.size);
         self.size = 0;
         tracing::debug!(
             start = record.span.start,
@@ -1000,14 +1068,49 @@ impl Index {
             .push(Arc::new(entry));
     }
 
-    fn reserve(&mut self, capacity: u64, size: u64) -> Option<()> {
+    fn reserve(&mut self, capacity: u64, size: u64, version: Option<&CacheVersion>) -> Option<()> {
+        self.release_stale_reservations();
         let remaining = capacity.checked_sub(size.checked_add(self.reserved)?)?;
         self.evict(remaining);
         if self.size > remaining {
             return None;
         }
         self.reserved += size;
+        if let Some(version) = version {
+            let tracked = self
+                .reservations
+                .entry(version.id)
+                .or_insert_with(|| (version.key.clone(), 0));
+            tracked.1 += size;
+        }
         Some(())
+    }
+
+    /// Return quota still held by writers whose representation has been
+    /// retired, so a paused or abandoned old writer cannot starve a newer one.
+    fn release_stale_reservations(&mut self) {
+        let stale: Vec<u64> = self
+            .reservations
+            .iter()
+            .filter(|(id, (key, _))| self.active(key).is_none_or(|active| active.id != **id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some((_, size)) = self.reservations.remove(&id) {
+                self.reserved -= size;
+            }
+        }
+    }
+
+    fn release_reservation(&mut self, version: u64, size: u64) {
+        if let Some((_, tracked)) = self.reservations.get_mut(&version) {
+            let released = size.min(*tracked);
+            *tracked -= released;
+            self.reserved -= released;
+            if *tracked == 0 {
+                self.reservations.remove(&version);
+            }
+        }
     }
 
     fn reap_retired(&mut self) {
@@ -1211,7 +1314,7 @@ impl IntervalWriter {
 
 pub(crate) struct WholeWriter {
     source: String,
-    metadata: Metadata,
+    version: Arc<CacheVersion>,
     data: StagedInterval,
 }
 
@@ -1221,11 +1324,14 @@ impl WholeWriter {
         let cache = &reservation.cache;
         {
             let mut index = cache.index.lock().unwrap();
-            if !cache.refresh_index(&mut index) || reservation.generation != index.generation {
+            if !cache.refresh_index(&mut index)
+                || reservation.generation != index.generation
+                || !index.is_current(&self.version)
+            {
                 return None;
             }
             index
-                .reserve(cache.capacity, bytes.len() as u64)
+                .reserve(cache.capacity, bytes.len() as u64, Some(&self.version))
                 .or_else(|| {
                     record_download_failure(DownloadCacheFailure::Capacity);
                     None
@@ -1246,14 +1352,38 @@ impl WholeWriter {
     }
 
     pub(crate) async fn finish(mut self) {
-        let reservation = &self.data.reservation;
-        self.metadata.size = reservation.size;
-        if self.metadata.size > 0
-            && let Some(version) =
-                reservation
-                    .cache
-                    .adopt(&self.source, self.metadata, reservation.generation)
-        {
+        let received = self.data.reservation.size;
+        if received == 0 {
+            return;
+        }
+        let cache = self.data.reservation.cache.clone();
+        let generation = self.data.reservation.generation;
+        let mut version = self.version.clone();
+        if version.metadata.size != received {
+            // The origin omitted Content-Length; record the received size only
+            // while this representation is still the current one. The check and
+            // the size adoption share one index lock so a newer version adopted
+            // in between cannot be retired by this late finish.
+            #[cfg(test)]
+            if let Some(race) = cache.whole_finish_race.lock().unwrap().take() {
+                race();
+            }
+            let Some(updated) =
+                cache.adopt_received_size(&self.source, &version, received, generation)
+            else {
+                return;
+            };
+            version = updated;
+            // The quota moved to the corrected id inside adopt_received_size;
+            // keep the reservation identity in sync so a failed or skipped
+            // commit still releases it on drop.
+            self.data.reservation.version = version.id;
+            #[cfg(test)]
+            if let Some(race) = cache.whole_commit_race.lock().unwrap().take() {
+                race();
+            }
+        }
+        if cache.is_current(&version) {
             self.data.commit(version).await;
         }
     }
@@ -1711,5 +1841,193 @@ mod tests {
         store(&cache, &replacement, 0..20).await;
         assert!(matches!(cache.plan(&key(SOURCE), 0..20, &new).as_slice(),
                          [Piece::Cached(_, span)] if *span == (0..20)));
+    }
+
+    fn store_sync(cache: &Arc<Cache>, version: &Arc<CacheVersion>, span: Range<u64>) {
+        let bytes: Vec<u8> = span.clone().map(|offset| offset as u8).collect();
+        let reservation = cache.reserve(span.end - span.start, version).unwrap();
+        let stage = cache.stage_file().unwrap();
+        stage.as_file().write_all(&bytes).unwrap();
+        reservation.commit(stage, span, version.clone()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserving_reclaims_quota_held_by_a_retired_whole_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 100).unwrap();
+        let generation = cache.refresh();
+        let mut old = metadata(Some("\"v1\""));
+        old.size = 100;
+        let old_version = cache.adopt(SOURCE, old.clone(), generation).unwrap();
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), old.clone(), Some(100), generation)
+            .unwrap();
+        whole.write(&[1; 100]).await.unwrap();
+        assert_eq!(cache.index.lock().unwrap().reserved, 100);
+
+        // A newer representation retires the old writer, which stays paused and
+        // keeps holding its staged quota. A new reserve must reclaim it.
+        let new = metadata(Some("\"v2\""));
+        let new_version = cache.adopt(SOURCE, new.clone(), generation).unwrap();
+        let reservation = cache.reserve(100, &new_version);
+        assert!(
+            reservation.is_some(),
+            "stale writer must not starve the new version"
+        );
+        assert_eq!(cache.index.lock().unwrap().reserved, 100);
+
+        // Dropping the retired writer must not release the quota twice.
+        drop(whole);
+        assert_eq!(cache.index.lock().unwrap().reserved, 100);
+        drop(reservation);
+        assert_eq!(cache.index.lock().unwrap().reserved, 0);
+        let _ = old_version;
+    }
+
+    #[tokio::test]
+    async fn unknown_length_finish_does_not_retire_a_newer_published_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 4096).unwrap();
+        let generation = cache.refresh();
+        let mut old = metadata(Some("\"v1\""));
+        old.size = 0; // origin omitted Content-Length
+        let old_version = cache.adopt(SOURCE, old.clone(), generation).unwrap();
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), old.clone(), None, generation)
+            .unwrap();
+        whole.write(&[7; 100]).await.unwrap();
+
+        // Inject a newer representation that is adopted and published at the
+        // exact point where the old finish corrects its recorded size.
+        let racer = cache.clone();
+        let new = metadata(Some("\"v2\""));
+        *cache.whole_finish_race.lock().unwrap() = Some(Box::new(move || {
+            let version = racer.adopt(SOURCE, new.clone(), generation).unwrap();
+            store_sync(&racer, &version, 0..100);
+        }));
+        whole.finish().await;
+
+        assert!(cache.contains(SOURCE, None));
+        assert_eq!(
+            cache.metadata(&key(SOURCE)).unwrap().etag.as_deref(),
+            Some("\"v2\"")
+        );
+        let _ = old_version;
+        let published = directory.path().join("example.test/video.mp4");
+        assert_eq!(fs::read(published).unwrap(), (0..100).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn unknown_length_publish_releases_its_staged_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 100).unwrap();
+        let generation = cache.refresh();
+        let mut unknown = metadata(Some("\"v1\""));
+        unknown.size = 0; // origin omitted Content-Length
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, generation)
+            .unwrap();
+        whole.write(&[7; 100]).await.unwrap();
+        whole.finish().await;
+
+        assert!(cache.contains(SOURCE, None));
+        let index = cache.index.lock().unwrap();
+        assert_eq!(
+            index.reserved, 0,
+            "publishing must release the staged quota without waiting for the next reserve"
+        );
+        assert!(index.reservations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserving_between_size_correction_and_commit_keeps_staged_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 100).unwrap();
+        let generation = cache.refresh();
+        let mut unknown = metadata(Some("\"v1\""));
+        unknown.size = 0; // origin omitted Content-Length
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, generation)
+            .unwrap();
+        whole.write(&[7; 100]).await.unwrap();
+
+        // A second resource tries to reserve the full capacity in the window
+        // between the size correction (which adopts a new version id) and the
+        // commit. The staged bytes are still in use and must not be reclaimed
+        // as stale, or the cache would exceed its configured capacity.
+        let other_source = "https://example.test/other.mp4";
+        let mut other_metadata = metadata(Some("\"o1\""));
+        other_metadata.target = key(other_source);
+        let other_version = cache
+            .adopt(other_source, other_metadata, generation)
+            .unwrap();
+        let racer = cache.clone();
+        let outcome = Arc::new(Mutex::new(None));
+        let raced = outcome.clone();
+        *cache.whole_commit_race.lock().unwrap() = Some(Box::new(move || {
+            *raced.lock().unwrap() = Some(racer.reserve(100, &other_version).is_some());
+        }));
+        whole.finish().await;
+
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(false),
+            "in-flight staged quota must not be reclaimed as stale"
+        );
+        assert!(cache.contains(SOURCE, None));
+        let index = cache.index.lock().unwrap();
+        assert_eq!(index.reserved, 0);
+        assert!(index.size <= cache.capacity());
+    }
+
+    #[tokio::test]
+    async fn whole_finish_hooks_are_isolated_per_cache_instance() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = Cache::open(dir_a.path().to_owned(), 100).unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = Cache::open(dir_b.path().to_owned(), 100).unwrap();
+        let gen_a = a.refresh();
+        let gen_b = b.refresh();
+        let mut unknown = metadata(Some("\"v1\""));
+        unknown.size = 0; // origin omitted Content-Length
+
+        // Arm both hooks for b's writer only.
+        let finish_fired = Arc::new(Mutex::new(false));
+        let commit_fired = Arc::new(Mutex::new(false));
+        let flag = finish_fired.clone();
+        *b.whole_finish_race.lock().unwrap() = Some(Box::new(move || {
+            *flag.lock().unwrap() = true;
+        }));
+        let flag = commit_fired.clone();
+        *b.whole_commit_race.lock().unwrap() = Some(Box::new(move || {
+            *flag.lock().unwrap() = true;
+        }));
+
+        // An unrelated cache instance finishing its own unknown-length whole
+        // file must not consume b's hooks.
+        let mut whole_a = a
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, gen_a)
+            .unwrap();
+        whole_a.write(&[1; 10]).await.unwrap();
+        whole_a.finish().await;
+        assert!(
+            b.whole_finish_race.lock().unwrap().is_some(),
+            "a finished on another instance must not steal the finish hook"
+        );
+        assert!(
+            b.whole_commit_race.lock().unwrap().is_some(),
+            "a finished on another instance must not steal the commit hook"
+        );
+        assert!(!*finish_fired.lock().unwrap());
+        assert!(!*commit_fired.lock().unwrap());
+
+        // b's own finish consumes exactly its hooks.
+        let mut whole_b = b
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, gen_b)
+            .unwrap();
+        whole_b.write(&[2; 10]).await.unwrap();
+        whole_b.finish().await;
+        assert!(*finish_fired.lock().unwrap());
+        assert!(*commit_fired.lock().unwrap());
     }
 }
