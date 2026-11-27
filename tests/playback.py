@@ -27,6 +27,11 @@ class Origin(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_HEAD(self):
+        if self.server.head_unsupported:
+            self.send_response(405)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         self.reply()
 
     def do_GET(self):
@@ -130,6 +135,7 @@ class PlaybackTests(unittest.TestCase):
         origin.data = bytes(range(200))
         origin.etag = '"one"'
         origin.expired = origin.ignore_range = origin.truncate = False
+        origin.head_unsupported = False
         origin.delay = 0
         origin.block_range = origin.block_path = None
         origin.pause_body_range = None
@@ -322,6 +328,37 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(task["processed_bytes"], len(self.origin.data))
         published = self.cache / "127.0.0.1" / "download" / "movie.mp4"
         self.assertEqual(published.read_bytes(), self.origin.data)
+
+    def test_offline_hls_without_suffix_handles_unsupported_head(self):
+        self.start(capacity=8192)
+        self.origin.head_unsupported = True
+        self.origin.resources["/stream"] = (
+            "application/vnd.apple.mpegurl",
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nclip.ts\n#EXT-X-ENDLIST\n",
+        )
+        self.origin.resources["/clip.ts"] = ("video/mp2t", b"segment")
+        self.assertEqual(self.get(path="/stream")[0], 200)
+        self.assertEqual(self.await_offline_task("/stream")["state"], "completed")
+        self.origin.expired = True
+        status, _, playlist = self.get(path="/stream")
+        self.assertEqual(status, 200)
+        segment = next(line for line in playlist.decode().splitlines() if line.startswith("/"))
+        self.assertEqual(self.get(proxy_path=segment)[2], b"segment")
+
+    def test_offline_rejects_invalid_requests_with_bad_request(self):
+        self.start()
+        status, _, _ = self.get(
+            method="POST", proxy_path="/v1/offline/https://example.com/video.mp4"
+        )
+        self.assertEqual(status, 400)
+        path = "/v1/offline/" + self.source + "/video.mp4"
+        for bandwidth in ("0", "invalid"):
+            with self.subTest(bandwidth=bandwidth):
+                with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)) as conn:
+                    conn.request("POST", path, headers={"X-RPC-Bandwidth": bandwidth})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 400)
+                    response.read()
 
     def test_offline_reports_capacity_write_and_publication_failures(self):
         self.start(capacity=400)
@@ -807,6 +844,9 @@ unsized.ts
         self.start()
         self.assertEqual(self.get("80-99")[2], self.origin.data[80:100])
         self.assertEqual(len(self.origin.requests), 1)
+        status, headers, _ = self.get("-0")
+        self.assertEqual((status, headers["Content-Range"]), (416, "bytes */200"))
+        self.assertEqual(len(self.origin.requests), 1)
         self.assertEqual(self.get("75-90")[0], 403)
         self.assertEqual(self.origin.requests[-1][2], "bytes=75-79")
         self.stop()
@@ -814,6 +854,23 @@ unsized.ts
                        env={**os.environ, "RPC_CACHE_DIR": str(self.cache)})
         self.start()
         self.assertEqual(self.get("80-99")[0], 403)
+
+    def test_out_of_range_seek_revalidates_extended_replacement(self):
+        self.start()
+        self.assertEqual(self.get("0-99")[0], 206)
+        self.stop()
+        self.origin.data = bytes(range(240))
+        self.origin.etag = '"two"'
+        self.start()
+        status, headers, body = self.get("200-239")
+        self.assertEqual(
+            (status, headers["Content-Range"], body),
+            (206, "bytes 200-239/240", self.origin.data[200:240]),
+        )
+        self.assertEqual(self.origin.requests[-1], ("GET", SIGNED_PATH, "bytes=200-239"))
+        previous = len(self.origin.requests)
+        self.assertEqual(self.get("200-239")[2], self.origin.data[200:240])
+        self.assertEqual(len(self.origin.requests), previous)
 
     def test_deleted_interval_is_refilled_and_hits_again(self):
         self.start(log_level="debug")

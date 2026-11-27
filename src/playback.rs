@@ -817,7 +817,8 @@ async fn send_remote(
         match &mut writer {
             Some(BodyWriter::Interval(writer)) => writer.write(&data).await,
             Some(BodyWriter::Whole(whole)) => {
-                if whole.write(&data).await.is_none() {
+                let retained = whole.write(&data).await.is_some();
+                if !retained {
                     writer = None;
                 }
             }
@@ -971,7 +972,7 @@ fn unsatisfiable(size: u64) -> Result<Response<Body>> {
         .body(empty())?)
 }
 
-fn plain(status: StatusCode, message: &'static str) -> Response<Body> {
+pub(crate) fn plain(status: StatusCode, message: &'static str) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")

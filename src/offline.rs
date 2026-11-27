@@ -13,7 +13,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::{
     cache::{Cache, DOWNLOAD_CACHE_FAILURE, DownloadCacheFailure, key, record_download_failure},
     hls::{self, Resource},
-    playback::{Body, Playback, full},
+    playback::{Body, Playback, full, plain},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -247,14 +247,31 @@ impl Playback {
         request: &Request<impl Sized>,
         source: &str,
     ) -> Result<Response<Body>> {
-        self.origin.validate(source)?;
+        if self.origin.validate(source).is_err() {
+            return Ok(plain(
+                StatusCode::BAD_REQUEST,
+                "invalid or disallowed source URL",
+            ));
+        }
         let (status, payload) = match *request.method() {
             Method::POST => {
-                let bandwidth = request
-                    .headers()
-                    .get("x-rpc-bandwidth")
-                    .map(|value| value.to_str()?.parse::<u64>().map_err(anyhow::Error::from))
-                    .transpose()?;
+                let bandwidth = match request.headers().get("x-rpc-bandwidth") {
+                    None => None,
+                    Some(value) => match value
+                        .to_str()
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|bandwidth| *bandwidth > 0)
+                    {
+                        Some(bandwidth) => Some(bandwidth),
+                        None => {
+                            return Ok(plain(
+                                StatusCode::BAD_REQUEST,
+                                "expected a positive X-RPC-Bandwidth",
+                            ));
+                        }
+                    },
+                };
                 let (status, progress) = self.start_download(source, bandwidth)?;
                 (status, serde_json::to_vec(&progress)?)
             }
@@ -280,11 +297,21 @@ impl Playback {
         pins: &mut TaskPins,
     ) -> Result<State> {
         let uri = self.origin.validate(source)?;
-        let is_hls = if hls::playlist_path(uri.path()) {
-            true
+        let (is_hls, detected_playlist) = if hls::playlist_path(uri.path()) {
+            (true, None)
         } else {
             let response = self.offline_fetch(source, None, Method::HEAD, None).await?;
-            hls::playlist_type(response.headers())
+            if response.status().is_success() {
+                (hls::playlist_type(response.headers()), None)
+            } else {
+                let response = self.origin.fetch(source, Method::GET, None).await?;
+                if response.status().is_success() && hls::playlist_type(response.headers()) {
+                    let playlist = self.canonical_playlist(response).await?;
+                    (true, Some(playlist))
+                } else {
+                    (false, None)
+                }
+            }
         };
         if !is_hls {
             let complete = self.transfer(source, None, None, task).await?;
@@ -301,7 +328,10 @@ impl Playback {
         let published = self.cache.published_playlist(source);
         let canonical = match self.cache.original_playlist(source) {
             Some(playlist) => playlist,
-            None => self.download_manifest(source).await?,
+            None => match detected_playlist {
+                Some(playlist) => playlist,
+                None => self.download_manifest(source).await?,
+            },
         };
         if hls::uses_encryption(&canonical) {
             return Ok(State::Unsupported);
