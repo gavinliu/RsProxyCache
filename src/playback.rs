@@ -831,8 +831,16 @@ async fn send_remote(
         }
     };
     if disconnected {
-        if let Some(BodyWriter::Interval(writer)) = writer {
-            writer.finish_interrupted().await;
+        // Reading the declared byte count does not prove the origin response ended:
+        // a 206 without Content-Length is delimited by chunked framing or by closing
+        // the connection. Publish only when the origin also ends cleanly in time.
+        let complete =
+            length == Some(received) && writer.is_some() && origin_ended(&mut body).await;
+        match writer {
+            Some(BodyWriter::Interval(writer)) if complete => writer.finish().await,
+            Some(BodyWriter::Interval(writer)) => writer.finish_interrupted().await,
+            Some(BodyWriter::Whole(writer)) if complete => writer.finish().await,
+            _ => {}
         }
         return Ok(());
     }
@@ -849,6 +857,30 @@ async fn send_remote(
         sender.send(Ok(Frame::data(last))).await?;
     }
     Ok(())
+}
+
+/// How long a playback that already left waits for the origin to end a response
+/// whose declared bytes have been received.
+const END_OF_RESPONSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Waits a bounded time for the origin body to end on its own. Further data, a
+/// timeout, or a transport and framing error leaves the response unconfirmed.
+async fn origin_ended(body: &mut Incoming) -> bool {
+    loop {
+        let Ok(frame) = timeout(END_OF_RESPONSE, body.frame()).await else {
+            return false;
+        };
+        let frame = match frame {
+            // The origin ended its response.
+            None => return true,
+            // A transport or framing error, such as an unfinished chunked body.
+            Some(Err(_)) => return false,
+            Some(Ok(frame)) => frame,
+        };
+        if frame.into_data().is_ok_and(|data| !data.is_empty()) {
+            return false;
+        }
+    }
 }
 
 fn partial_metadata(response: &Response<Incoming>) -> Result<(Range<u64>, Metadata)> {

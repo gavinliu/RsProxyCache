@@ -98,6 +98,15 @@ class Origin(http.server.BaseHTTPRequestHandler):
                     self.wfile.flush()
                     state.release_range.wait(state.body_pause_seconds)
                     start = middle
+                if requested and requested == state.hold_body_range:
+                    # Send the whole range, then keep the response open so the
+                    # proxy cannot learn that the origin body has ended.
+                    written = self.wfile.write(data[start:end])
+                    self.wfile.flush()
+                    with state.transfer_lock:
+                        state.transfers.append((self.path, requested, written))
+                    state.release_range.wait(5)
+                    return
                 stop = (start + end) // 2 if state.truncate else end
                 written = self.wfile.write(data[start:stop])
                 with state.transfer_lock:
@@ -133,6 +142,7 @@ class PlaybackTests(unittest.TestCase):
         origin.delay = 0
         origin.block_range = origin.block_path = None
         origin.pause_body_range = None
+        origin.hold_body_range = None
         origin.body_pause_seconds = 5
         origin.release_range = threading.Event()
         self.source = f"http://127.0.0.1:{origin.server_port}"
@@ -225,6 +235,58 @@ class PlaybackTests(unittest.TestCase):
             self.assertEqual(published.read_bytes(), self.origin.data)
         finally:
             self.origin.release_range.set()
+
+    def leave_before_final_bytes(self, path):
+        """Receives the response head of a range whose body the origin sends in full
+        and then keeps open, and closes the connection without reading the body."""
+        self.origin.unsized = {path}
+        self.origin.hold_body_range = "bytes=0-99"
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)) as conn:
+            conn.request("GET", "/v1/" + self.source + path, headers={"Range": "bytes=0-99"})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 206)
+            # The proxy has received the whole range and is holding its final bytes.
+            deadline = time.monotonic() + 3
+            while not self.transfers() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)
+        self.origin.hold_body_range = None
+
+    def await_no_stage(self, timeout=8):
+        deadline = time.monotonic() + timeout
+        while list((self.cache / ".rpc").glob(".rpc-stage-*")) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(list((self.cache / ".rpc").glob(".rpc-stage-*")), [])
+
+    def test_fully_received_range_survives_player_leaving_before_final_bytes(self):
+        self.start()
+        path = "/movies/leave.mp4"
+        self.leave_before_final_bytes(path)
+        try:
+            # Let the proxy observe the disconnect, then let the origin end its response.
+            time.sleep(0.3)
+            self.origin.release_range.set()
+            self.await_no_stage()
+        finally:
+            self.origin.release_range.set()
+        self.origin.requests.clear()
+        status, _, body = self.get("0-99", path=path)
+        self.assertEqual((status, body), (206, self.origin.data[:100]))
+        self.assertEqual(self.origin.requests, [])
+
+    def test_unended_origin_response_is_not_cached_after_player_leaves(self):
+        self.start()
+        path = "/movies/stalled.mp4"
+        self.leave_before_final_bytes(path)
+        try:
+            # The origin keeps the response open, so its end cannot be confirmed.
+            self.await_no_stage()
+        finally:
+            self.origin.release_range.set()
+        self.origin.requests.clear()
+        status, _, body = self.get("0-99", path=path)
+        self.assertEqual((status, body), (206, self.origin.data[:100]))
+        self.assertEqual([span for _, _, span in self.origin.requests], ["bytes=0-99"])
 
     def test_mp4_query_collision_preserves_both_files_and_evicts_whole_video(self):
         self.start(capacity=400)
